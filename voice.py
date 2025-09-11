@@ -1,3 +1,12 @@
+search_mode_enabled = False
+
+def is_chrome_running():
+    # Checks if Chrome is running
+    for proc in os.popen('tasklist').readlines():
+        if 'chrome.exe' in proc:
+            return True
+    return False
+
 import os
 import time
 import wmi
@@ -322,7 +331,30 @@ def start_whatsapp_chat():
 
 def handle_command(command):
     command = normalize_command(command)
-    if "open whatsapp" in command:
+    global search_mode_enabled
+    if "enable search mode" in command:
+        if is_chrome_running():
+            search_mode_enabled = True
+            speak("Search mode enabled. Say your search queries.")
+        else:
+            speak("Chrome browser is not open. Please open Chrome first.")
+    elif "disable search mode" in command:
+        if search_mode_enabled:
+            search_mode_enabled = False
+            speak("Search mode disabled.")
+        else:
+            speak("Search mode is already disabled.")
+    elif search_mode_enabled:
+        # Only process search queries in search mode
+        if any(x in command for x in ["exit", "stop", "cancel"]):
+            search_mode_enabled = False
+            speak("Exiting search mode.")
+        elif command:
+            chrome_path = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+            webbrowser.register('chrome', None, webbrowser.BackgroundBrowser(chrome_path))
+            webbrowser.get('chrome').open(f"https://www.google.com/search?q={command}")
+            speak(f"Searching for {command}")
+    # ...existing code...
         start_whatsapp_chat()
     elif "open youtube" in command:
         open_website("youtube.com")
@@ -340,11 +372,6 @@ def handle_command(command):
         speak("Opening calculator.")
     elif "close calculator" in command:
         close_app("CalculatorApp.exe")
-    elif "open chrome" in command:
-        subprocess.Popen(["C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"])
-        speak("Opening Chrome.")
-    elif "close chrome" in command:
-        close_app("chrome.exe")
     elif "open notepad" in command:
         subprocess.Popen(["notepad.exe"])
     elif "close notepad" in command:
