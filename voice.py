@@ -13,7 +13,6 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from webdriver_manager.chrome import ChromeDriverManager
 
-
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 from ctypes import cast, POINTER
 from comtypes import CLSCTX_ALL
@@ -32,28 +31,82 @@ def normalize_command(text):
     if not text:
         return ""
     normalized = text.lower().strip()
-    # Normalize common variants to simplify matching
     normalized = normalized.replace("wi-fi", "wifi")
     normalized = normalized.replace("wi fi", "wifi")
-    normalized = normalized.replace(" wi  fi", " wifi ")
     return normalized
 
 def get_voice_command(prompt=None):
     recognizer = sr.Recognizer()
-    with sr.Microphone() as source:
-        if prompt:
-            speak(prompt)
-        print("Listening...")
-        audio = recognizer.listen(source)
-        try:
-            command = normalize_command(recognizer.recognize_google(audio))
-            print(f"Command: {command}")
-            return command
-        except sr.UnknownValueError:
-            speak("Sorry, I did not understand.")
-        except sr.RequestError:
-            speak("Speech service is not available.")
-    return ""
+    
+    recognizer.energy_threshold = 300
+    recognizer.dynamic_energy_threshold = True
+    recognizer.pause_threshold = 0.8
+    recognizer.phrase_threshold = 0.3
+    recognizer.non_speaking_duration = 0.8
+    
+    try:
+        with sr.Microphone() as source:
+            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            if prompt:
+                speak(prompt)
+            print("Listening...")
+            audio = recognizer.listen(source, timeout=10, phrase_time_limit=5)
+
+            # Try Google Speech Recognition first
+            try:
+                command = normalize_command(recognizer.recognize_google(audio))
+                print(f"Command: {command}")
+                return command
+
+            except sr.RequestError:
+                # No internet available → try offline recognition
+                print("No internet connection. Switching to offline recognition...")
+                speak("No internet connection. Using offline mode.")
+                try:
+                    command = normalize_command(recognizer.recognize_sphinx(audio))
+                    print(f"Command (offline): {command}")
+                    return command
+                except sr.UnknownValueError:
+                    speak("Sorry, could not understand you in offline mode. You may type manually.")
+                    return None
+                except Exception as e:
+                    speak(f"Offline recognition failed: {e}. Switching to text input.")
+                    return get_text_input()
+
+            except sr.UnknownValueError:
+                speak("Sorry, I did not understand. Please try again.")
+                return None
+
+    except sr.WaitTimeoutError:
+        speak("Listening timeout. Please try again.")
+        return None
+    except OSError as e:
+        if "No default input device" in str(e):
+            speak("No microphone found. Switching to text input.")
+        else:
+            speak(f"Microphone error: {e}. Switching to text input.")
+        return get_text_input()
+    except Exception as e:
+        speak(f"Unexpected error: {e}. Switching to text input.")
+        return get_text_input()
+
+def get_text_input():
+    """Fallback text input when speech recognition fails"""
+    try:
+        print("\n" + "="*50)
+        print("SPEECH RECOGNITION UNAVAILABLE")
+        print("Switching to text input mode...")
+        print("Type your commands or 'exit' to quit")
+        print("="*50)
+        
+        command = input("\nEnter command: ").strip()
+        if command:
+            return normalize_command(command)
+        return None
+    except KeyboardInterrupt:
+        return "exit"
+    except EOFError:
+        return "exit"
 
 def ask_openrouter(question):
     headers = {
@@ -64,7 +117,6 @@ def ask_openrouter(question):
         "model": "mistralai/mistral-7b-instruct",
         "messages": [{"role": "user", "content": question}]
     }
-
     try:
         response = requests.post(API_URL, headers=headers, json=data)
         response.raise_for_status()
@@ -133,6 +185,8 @@ def change_brightness(action):
     except Exception as e:
         speak(f"Brightness error: {e}")
 
+# ========== WIFI CONTROL ==========
+
 def get_wifi_interface_name():
     try:
         result = subprocess.run(
@@ -142,10 +196,13 @@ def get_wifi_interface_name():
             check=True
         )
         for line in result.stdout.splitlines():
-            if line.strip().lower().startswith("name") and ":" in line:
-                return line.split(":", 1)[1].strip()
-    except Exception:
-        pass
+            if line.strip().lower().startswith("name"):
+                interface = line.split(":", 1)[1].strip()
+                return interface if interface else "Wi-Fi"
+    except subprocess.CalledProcessError:
+        speak("Unable to get Wi-Fi interface name.")
+    except Exception as e:
+        speak(f"Error finding Wi-Fi interface: {e}")
     return "Wi-Fi"
 
 def set_wifi_enabled(enabled):
@@ -153,12 +210,16 @@ def set_wifi_enabled(enabled):
         interface_name = get_wifi_interface_name()
         state = "enabled" if enabled else "disabled"
         command = f'netsh interface set interface name="{interface_name}" admin={state}'
-        subprocess.run(command, shell=True, check=True)
-        speak(f"Wi-Fi {'enabled' if enabled else 'disabled'}.")
-    except subprocess.CalledProcessError as e:
-        speak("Failed to change Wi-Fi state. Try running as administrator.")
+        result = subprocess.run(command, shell=True, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            speak(f"Wi-Fi {'turned on' if enabled else 'turned off'}.")
+        else:
+            speak(f"Failed to {'enable' if enabled else 'disable'} Wi-Fi. Try running as administrator.")
     except Exception as e:
         speak(f"Wi-Fi control error: {e}")
+
+# ========== GOOGLE SEARCH MODE ==========
 
 def google_search_mode():
     speak("What would you like to search for?")
@@ -173,6 +234,8 @@ def google_search_mode():
             webbrowser.get('chrome').open(f"https://www.google.com/search?q={query}")
             speak(f"Searching for {query}")
 
+# ========== CHROME TABS CONTROL ==========
+
 def manage_chrome_tabs(action):
     try:
         if action == "new":
@@ -186,6 +249,8 @@ def manage_chrome_tabs(action):
         speak(f"Tab {action}")
     except:
         speak("Tab control failed.")
+
+# ========== FOLDER CONTROL ==========
 
 def open_folder(folder_name):
     try:
@@ -215,7 +280,7 @@ def close_folder(folder_name):
     except Exception as e:
         speak(f"Error closing folder: {e}")
 
-# ========== WHATSAPP FEATURE STARTS ==========
+# ========== WHATSAPP FEATURE ==========
 
 def launch_whatsapp_web():
     speak("Opening WhatsApp Web. Please scan the QR code.")
@@ -232,7 +297,6 @@ def send_whatsapp_message(driver, contact_name, message_text):
         time.sleep(3)
         search_box.send_keys(Keys.ENTER)
         time.sleep(2)
-
         message_box = driver.find_element(By.XPATH, "//div[@contenteditable='true'][@data-tab='10']")
         message_box.click()
         message_box.send_keys(message_text)
@@ -299,7 +363,7 @@ def handle_command(command):
         change_brightness("decrease")
     elif any(x in command for x in ["turn on wifi", "enable wifi", "wifi on", "turn on wi-fi", "enable wi-fi", "wi-fi on"]):
         set_wifi_enabled(True)
-    elif any(x in command for x in ["turn off wifi", "disable wifi", "wifi off", "turn off wi-fi", "disable wi-fi", "wi-fi off"]):
+    elif any(x in command for x in ["turn off wifi", "disable wifi", "wifi off", "turn off wi-fi", "disable wi-fi", "wi-fi off", "off wifi"]):
         set_wifi_enabled(False)
     elif "new tab" in command:
         manage_chrome_tabs("new")
@@ -334,10 +398,49 @@ def handle_command(command):
 
 def main():
     speak("Voice assistant is now active.")
+    print("Voice assistant is now active.")
+    print("Note: Turning off WiFi will switch to offline mode or text input.")
+    print("Press Ctrl+C to exit.\n")
+    
+    consecutive_failures = 0
+    max_failures = 3
+    
     while True:
-        command = get_voice_command()
-        if command:
-            handle_command(command)
+        try:
+            command = get_voice_command()
+            
+            if command is None:
+                consecutive_failures += 1
+                if consecutive_failures >= max_failures:
+                    print("Multiple speech recognition failures. Switching to text input mode.")
+                    speak("Switching to text input mode due to speech recognition issues.")
+                    
+                    while True:
+                        command = get_text_input()
+                        if command:
+                            if command == "exit":
+                                speak("Goodbye!")
+                                exit()
+                            handle_command(command)
+                            consecutive_failures = 0
+                            break
+                else:
+                    print(f"Speech recognition failed ({consecutive_failures}/{max_failures})")
+                    time.sleep(1)
+            elif command:
+                consecutive_failures = 0
+                handle_command(command)
+            else:
+                continue
+                
+        except KeyboardInterrupt:
+            print("\nExiting voice assistant...")
+            speak("Goodbye!")
+            break
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            speak("An error occurred. Please try again.")
+            time.sleep(1)
 
 if __name__ == "__main__":
     main()
