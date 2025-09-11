@@ -1,3 +1,4 @@
+import pygetwindow as gw
 search_mode_enabled = False
 
 def is_chrome_running():
@@ -247,6 +248,17 @@ def google_search_mode():
 
 def manage_chrome_tabs(action):
     try:
+        if not is_chrome_running():
+            speak("Chrome browser is not open. Please open Chrome first to manage tabs.")
+            return
+        # Bring Chrome to the foreground
+        chrome_windows = [w for w in gw.getWindowsWithTitle('Google Chrome') if w.visible]
+        if chrome_windows:
+            chrome_windows[0].activate()
+            time.sleep(0.2)  # Give time for window to focus
+        else:
+            speak("Could not find a visible Chrome window to focus.")
+            return
         if action == "new":
             pyautogui.hotkey('ctrl', 't')
         elif action == "next":
@@ -256,8 +268,8 @@ def manage_chrome_tabs(action):
         elif action == "close":
             pyautogui.hotkey('ctrl', 'w')
         speak(f"Tab {action}")
-    except:
-        speak("Tab control failed.")
+    except Exception as e:
+        speak(f"Tab control failed: {e}")
 
 # ========== FOLDER CONTROL ==========
 
@@ -400,10 +412,23 @@ def handle_command(command):
         manage_chrome_tabs("previous")
     elif "close tab" in command:
         manage_chrome_tabs("close")
-    elif "search for" in command:
-        query = command.replace("search for", "").strip()
+    elif "search for" in command or "what is the weather" in command or "weather today" in command or command.strip() == "weather":
+        if "search for" in command:
+            query = command.replace("search for", "").strip()
+            if not query:
+                query = "weather"
+        elif "what is the weather" in command:
+            query = "weather"
+        elif "weather today" in command:
+            query = "weather today"
+        elif command.strip() == "weather":
+            query = "weather"
+        else:
+            query = command
         speak(f"Searching for {query}")
-        webbrowser.open(f"https://www.google.com/search?q={query}")
+        chrome_path = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+        webbrowser.register('chrome', None, webbrowser.BackgroundBrowser(chrome_path))
+        webbrowser.get('chrome').open(f"https://www.google.com/search?q={query}")
     elif "what is" in command or "who is" in command or "define" in command:
         response = ask_openrouter(command)
         speak(response)
@@ -430,36 +455,17 @@ def main():
     print("Press Ctrl+C to exit.\n")
     
     consecutive_failures = 0
-    max_failures = 3
-    
     while True:
         try:
             command = get_voice_command()
-            
             if command is None:
-                consecutive_failures += 1
-                if consecutive_failures >= max_failures:
-                    print("Multiple speech recognition failures. Switching to text input mode.")
-                    speak("Switching to text input mode due to speech recognition issues.")
-                    
-                    while True:
-                        command = get_text_input()
-                        if command:
-                            if command == "exit":
-                                speak("Goodbye!")
-                                exit()
-                            handle_command(command)
-                            consecutive_failures = 0
-                            break
-                else:
-                    print(f"Speech recognition failed ({consecutive_failures}/{max_failures})")
-                    time.sleep(1)
+                print("Speech recognition failed. Please try again.")
+                time.sleep(1)
+                continue
             elif command:
-                consecutive_failures = 0
                 handle_command(command)
             else:
                 continue
-                
         except KeyboardInterrupt:
             print("\nExiting voice assistant...")
             speak("Goodbye!")
