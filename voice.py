@@ -1,5 +1,6 @@
 import pygetwindow as gw
 search_mode_enabled = False
+recording_thread = None
 
 def is_chrome_running():
     # Checks if Chrome is running
@@ -11,12 +12,16 @@ def is_chrome_running():
 import os
 import time
 import wmi
+import cv2
+import numpy as np
 import requests
 import pyttsx3
 import pyautogui
 import subprocess
 import webbrowser
 import speech_recognition as sr
+import threading
+from datetime import datetime
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -339,6 +344,58 @@ def start_whatsapp_chat():
         else:
             speak("Cancelled sending.")
 
+# ========== SCREEN RECORDING ==========
+
+recording = False
+
+def record_screen():
+    global recording
+    # Create a unique filename with a timestamp
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"Recording_{timestamp}.avi"
+    
+    # Get screen size
+    screen_size = pyautogui.size()
+    
+    # Define the codec and create a VideoWriter object
+    fourcc = cv2.VideoWriter_fourcc(*"XVID")
+    out = cv2.VideoWriter(filename, fourcc, 20.0, screen_size)
+    
+    print(f"Recording started. Saving to {filename}")
+    
+    while recording:
+        # Capture a screenshot
+        img = pyautogui.screenshot()
+        # Convert the screenshot to a numpy array
+        frame = np.array(img)
+        # Convert it from BGR(OpenCV default) to RGB
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Write the frame to the video file
+        out.write(frame)
+
+    # Release the VideoWriter and clean up
+    out.release()
+    print("Recording stopped and saved.")
+
+def start_screen_recording():
+    global recording, recording_thread
+    if not recording:
+        recording = True
+        recording_thread = threading.Thread(target=record_screen)
+        recording_thread.start()
+        speak("Screen recording has started.")
+    else:
+        speak("Screen recording is already in progress.")
+
+def stop_screen_recording():
+    global recording
+    if recording:
+        recording = False
+        # The thread will stop on its own when `recording` is False
+        speak("Screen recording stopped and saved.")
+    else:
+        speak("No screen recording is currently active.")
+
 # ========== MAIN HANDLER ==========
 
 def handle_command(command):
@@ -442,6 +499,10 @@ def handle_command(command):
             if folder in command:
                 close_folder(folder)
                 return
+    elif "start screen recording" in command:
+        start_screen_recording()
+    elif "stop screen recording" in command:
+        stop_screen_recording()
     elif "exit" in command or "stop" in command:
         speak("Goodbye!")
         exit()
