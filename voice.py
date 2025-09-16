@@ -396,6 +396,21 @@ def stop_screen_recording():
     else:
         speak("No screen recording is currently active.")
 
+# ========== SCREENSHOT ==========
+
+def take_screenshot():
+    """Takes a screenshot and saves it with a unique filename."""
+    try:
+        # Create a unique filename with a timestamp
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filename = f"Screenshot_{timestamp}.png"
+        
+        # Take the screenshot
+        pyautogui.screenshot(filename)
+        speak(f"Screenshot taken and saved as {filename}")
+    except Exception as e:
+        speak(f"Sorry, I failed to take a screenshot. Error: {e}")
+
 # ========== MAIN HANDLER ==========
 
 def handle_command(command):
@@ -503,6 +518,8 @@ def handle_command(command):
         start_screen_recording()
     elif "stop screen recording" in command:
         stop_screen_recording()
+    elif "take a screenshot" in command or "capture screen" in command:
+        take_screenshot()
     elif "exit" in command or "stop" in command:
         speak("Goodbye!")
         exit()
