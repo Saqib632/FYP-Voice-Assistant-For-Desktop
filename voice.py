@@ -25,10 +25,7 @@ from datetime import datetime
 import winreg
 import ctypes
 
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from webdriver_manager.chrome import ChromeDriverManager
+
 
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 from ctypes import cast, POINTER
@@ -380,44 +377,6 @@ def close_folder(folder_name):
     except Exception as e:
         speak(f"Error closing folder: {e}")
 
-# ========== WHATSAPP FEATURE ==========
-
-def launch_whatsapp_web():
-    speak("Opening WhatsApp Web. Please scan the QR code.")
-    driver = webdriver.Chrome(ChromeDriverManager().install())
-    driver.get("https://web.whatsapp.com")
-    time.sleep(20)
-    return driver
-
-def send_whatsapp_message(driver, contact_name, message_text):
-    try:
-        search_box = driver.find_element(By.XPATH, "//div[@contenteditable='true'][@data-tab='3']")
-        search_box.click()
-        search_box.send_keys(contact_name)
-        time.sleep(3)
-        search_box.send_keys(Keys.ENTER)
-        time.sleep(2)
-        message_box = driver.find_element(By.XPATH, "//div[@contenteditable='true'][@data-tab='10']")
-        message_box.click()
-        message_box.send_keys(message_text)
-        message_box.send_keys(Keys.ENTER)
-        speak(f"Message sent to {contact_name}")
-    except Exception as e:
-        speak(f"Failed to send message to {contact_name}: {e}")
-
-def start_whatsapp_chat():
-    driver = launch_whatsapp_web()
-    while True:
-        contact = get_voice_command("Who do you want to message?")
-        if contact in ["exit", "stop"]:
-            break
-        message = get_voice_command("What message do you want to send?")
-        confirm = get_voice_command("Say 'send' to send the message")
-        if "send" in confirm:
-            send_whatsapp_message(driver, contact, message)
-        else:
-            speak("Cancelled sending.")
-
 # ========== SCREEN RECORDING ==========
 
 recording = False
@@ -512,8 +471,7 @@ def handle_command(command):
             webbrowser.register('chrome', None, webbrowser.BackgroundBrowser(chrome_path))
             webbrowser.get('chrome').open(f"https://www.google.com/search?q={command}")
             speak(f"Searching for {command}")
-    # ...existing code...
-        start_whatsapp_chat()
+    # ...existing code... (WhatsApp feature removed)
     elif "open youtube" in command:
         open_website("youtube.com")
     elif "open google" in command or command == "google":
