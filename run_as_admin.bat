@@ -21,7 +21,12 @@ if %errorLevel% == 0 (
 )
 
 echo [INFO] Navigating to project directory...
-cd /d "D:\My Projects\New folder (2)"
+echo [INFO] Navigating to project directory...
+REM Change to the directory where this batch file is located (works with spaces)
+pushd "%~dp0"  >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] Failed to change directory to "%~dp0". The script may not run from the correct folder.
+)
 
 echo [INFO] Starting Voice Assistant...
 echo [INFO] You can now use WiFi control commands!
@@ -35,7 +40,17 @@ echo Press Ctrl+C to stop the assistant
 echo ========================================
 echo.
 
-python voice.py
+REM Run the voice script using the py launcher if available, otherwise fallback to python.
+REM Using the full path ensures the script is loaded from the project folder even if the current working directory differs.
+if exist "%~dp0voice.py" (
+    py "%~dp0voice.py" || python "%~dp0voice.py"
+) else (
+    echo [WARN] "%~dp0voice.py" not found. Trying to run by relative name...
+    py voice.py || python voice.py
+)
+
+REM Return to original directory
+popd >nul 2>&1
 
 echo.
 echo [INFO] Voice Assistant has stopped.

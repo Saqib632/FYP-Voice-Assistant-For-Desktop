@@ -22,6 +22,8 @@ import webbrowser
 import speech_recognition as sr
 import threading
 from datetime import datetime
+import winreg
+import ctypes
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -159,6 +161,50 @@ def close_app(app_name):
     except Exception as e:
         speak(f"Could not close {app_name}: {e}")
 
+
+def close_chrome():
+    """Close Google Chrome processes.
+
+    Tries a graceful termination using psutil if available, waits briefly,
+    and falls back to taskkill /F to ensure processes are terminated.
+    """
+    try:
+        # Try graceful termination using psutil if installed
+        try:
+            import psutil
+            chrome_procs = []
+            for p in psutil.process_iter(['name']):
+                name = p.info.get('name')
+                if name and 'chrome' in name.lower():
+                    chrome_procs.append(p)
+
+            if chrome_procs:
+                for p in chrome_procs:
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+
+                gone, alive = psutil.wait_procs(chrome_procs, timeout=5)
+                # kill any remaining
+                for p in alive:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+
+                speak("Closed Google Chrome.")
+                return
+        except Exception:
+            # psutil not available or failed — fall back to taskkill
+            pass
+
+        # Fallback: force kill using taskkill
+        os.system('taskkill /IM chrome.exe /F')
+        speak("Closed Google Chrome.")
+    except Exception as e:
+        speak(f"Failed to close Chrome: {e}")
+
 def change_volume(action):
     try:
         devices = AudioUtilities.GetSpeakers()
@@ -199,6 +245,34 @@ def change_brightness(action):
                 speak("Brightness decreased.")
     except Exception as e:
         speak(f"Brightness error: {e}")
+
+# ========== WINDOW THEME CONTROL ==========
+def set_windows_theme(dark=True):
+    """Set Windows system and apps theme to dark (True) or light (False).
+    This writes to the current user's Personalize registry keys and broadcasts
+    the setting change so the UI updates.
+    """
+    try:
+        personalize_key = r"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"
+        # 0 = dark, 1 = light
+        value = 0 if dark else 1
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, personalize_key, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, "AppsUseLightTheme", 0, winreg.REG_DWORD, value)
+            winreg.SetValueEx(key, "SystemUsesLightTheme", 0, winreg.REG_DWORD, value)
+
+        # Notify the system about the change
+        HWND_BROADCAST = 0xFFFF
+        WM_SETTINGCHANGE = 0x001A
+        SMTO_ABORTIFHUNG = 0x0002
+        result = ctypes.c_ulong()
+        ctypes.windll.user32.SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+                                                 ctypes.c_wchar_p("ImmersiveColorSet"), SMTO_ABORTIFHUNG, 5000,
+                                                 ctypes.byref(result))
+        return True
+    except Exception as e:
+        speak(f"Failed to change theme: {e}")
+        return False
+
 
 # ========== WIFI CONTROL ==========
 
@@ -460,6 +534,18 @@ def handle_command(command):
         subprocess.Popen(["notepad.exe"])
     elif "close notepad" in command:
         close_app("notepad.exe")
+    elif "close chrome" in command or "close google chrome" in command:
+        close_chrome()
+    elif any(x in command for x in ["enable dark mode", "enable dark", "dark mode", "turn on dark mode", "turn on dark"]):
+        if set_windows_theme(dark=True):
+            speak("Dark mode enabled.")
+        else:
+            speak("Could not enable dark mode.")
+    elif any(x in command for x in ["enable light mode", "enable light", "light mode", "turn on light mode", "turn on light"]):
+        if set_windows_theme(dark=False):
+            speak("Light mode enabled.")
+        else:
+            speak("Could not enable light mode.")
     elif command.startswith("increase volume"):
         change_volume("increase")
     elif command.startswith("decrease volume"):
