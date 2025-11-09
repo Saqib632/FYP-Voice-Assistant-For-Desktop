@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 import requests
 import pyttsx3
+import queue
 import pyautogui
 import subprocess
 import webbrowser
@@ -24,6 +25,359 @@ import threading
 from datetime import datetime
 import winreg
 import ctypes
+from PIL import ImageGrab
+try:
+    import pytesseract
+    HAS_PYTESSERACT = True
+except Exception:
+    HAS_PYTESSERACT = False
+
+# WhatsApp Desktop integration (keyboard automation)
+whatsapp_current_chat = None
+last_message_text = None
+awaiting_contact_search = False
+awaiting_contact_selection = False
+_whatsapp_search_query = None
+whatsapp_suggestions = []
+messaging_mode = None  # 'text' when in text-typing mode
+messaging_thread = None
+
+def _focus_whatsapp_window(timeout=8):
+    """Bring WhatsApp window to the foreground. Return True if focused."""
+    for _ in range(int(timeout/0.5)):
+        wins = [w for w in gw.getWindowsWithTitle('WhatsApp') if w.visible]
+        if wins:
+            try:
+                win = wins[0]
+                win.activate()
+                time.sleep(0.3)
+                return True
+            except Exception:
+                pass
+        time.sleep(0.5)
+    return False
+
+def open_whatsapp_app():
+    """Open WhatsApp Desktop via Start menu if not already open, then focus it."""
+    # Try to focus first
+    if _focus_whatsapp_window():
+        speak('WhatsApp is already open.')
+        return True
+
+    # Open Start, type WhatsApp, press Enter
+    try:
+        pyautogui.press('win')
+        time.sleep(0.5)
+        pyautogui.typewrite('WhatsApp', interval=0.05)
+        time.sleep(0.3)
+        pyautogui.press('enter')
+        # wait for app to appear
+        for _ in range(20):
+            if _focus_whatsapp_window():
+                speak('Opened WhatsApp.')
+                return True
+            time.sleep(0.5)
+    except Exception as e:
+        speak(f'Failed to open WhatsApp: {e}')
+    speak('Could not open WhatsApp. Please open it manually and try again.')
+    return False
+
+def _search_contact_and_prepare(query):
+    """Type the query into WhatsApp's search (Ctrl+K) and leave results visible.
+    We do not parse UI; we leave the UI for the user and set flags for selection.
+    """
+    if not _focus_whatsapp_window():
+        speak('WhatsApp window not found. Please open WhatsApp first.')
+        return False
+    try:
+        pyautogui.hotkey('ctrl', 'k')
+        time.sleep(0.3)
+        pyautogui.hotkey('ctrl', 'a')
+        pyautogui.press('backspace')
+        time.sleep(0.1)
+        pyautogui.typewrite(query, interval=0.03)
+        time.sleep(0.6)
+        return True
+    except Exception as e:
+        speak(f'Contact search failed: {e}')
+        return False
+
+def _open_top_search_result():
+    """Assumes search results visible; pressing Enter opens the top result."""
+    try:
+        pyautogui.press('enter')
+        time.sleep(0.6)
+        return True
+    except Exception:
+        return False
+
+
+def _open_search_result_by_index(index=1):
+    """Open the nth search result (1-based) by sending Down arrows then Enter.
+    This is more reliable than pressing Enter while the search box is focused.
+    """
+    # Try key navigation first (Down arrows then Enter)
+    try:
+        steps = max(1, index)
+        for _ in range(steps):
+            pyautogui.press('down')
+            time.sleep(0.12)
+        pyautogui.press('enter')
+        time.sleep(0.6)
+        return True
+    except Exception:
+        pass
+
+    # Fallback: try OCR-based click helper (which itself falls back to coordinates)
+    return _click_contact_by_name_or_index(name=None, index=index)
+
+def _type_and_send_text_app(text):
+    """Type into the message box of WhatsApp Desktop and press Enter."""
+    if not _focus_whatsapp_window():
+        speak('WhatsApp window not found. Please open WhatsApp first.')
+        return False
+    try:
+        # Ensure message input is focused: press Tab a few times if needed
+        # In most WhatsApp Desktop installs, after opening a chat the message box is focused
+        pyautogui.typewrite(text, interval=0.02)
+        pyautogui.press('enter')
+        return True
+    except Exception as e:
+        speak(f'Failed to type message: {e}')
+        return False
+
+def _text_message_worker():
+    """Background loop to listen and type messages while in text mode.
+    This worker catches exceptions from the speech recognizer so it doesn't
+    crash, and falls back to text input when voice fails.
+    """
+    global messaging_mode, last_message_text, messaging_thread
+    stop_variants = (
+        'stop text mode', 'exit text mode', 'disable text message', 'disable text',
+        'disable text mode', 'turn off text message', 'stop text message'
+    )
+    speak('Text message mode started. Say "stop text mode" to finish.')
+    try:
+        while messaging_mode == 'text':
+            try:
+                cmd = get_voice_command()
+            except Exception as e:
+                # Catch any exceptions from the recognizer and switch to text input
+                speak(f'Voice input error: {e}. Switching to text input for this message.', wait=False)
+                cmd = get_text_input()
+
+            if not cmd:
+                continue
+            # normalize for matching
+            norm = cmd.lower()
+            # stop if any stop variant appears
+            if any(variant in norm for variant in stop_variants):
+                messaging_mode = None
+                speak('Exiting text message mode.', wait=False)
+                break
+            if 'forward message' in norm:
+                # handled by global forward flow; ignore here to avoid inserting text
+                handle_command('forward message')
+                continue
+            # don't allow the literal trigger/stop words to be typed
+            safe = cmd
+            for v in ('forward message',) + stop_variants:
+                safe = safe.replace(v, '')
+            safe = safe.strip()
+            if safe:
+                ok = _type_and_send_text_app(safe)
+                if ok:
+                    last_message_text = safe
+    finally:
+        # clear thread reference when worker exits
+        try:
+            messaging_thread = None
+        except Exception:
+            pass
+
+def close_whatsapp_app():
+    """Close WhatsApp Desktop gracefully (Alt+F4) and fall back to taskkill."""
+    try:
+        # Try graceful close
+        focused = _focus_whatsapp_window(timeout=3)
+        if focused:
+            try:
+                pyautogui.hotkey('alt', 'f4')
+                time.sleep(0.6)
+                # check if still present
+                if not _focus_whatsapp_window(timeout=2):
+                    speak('WhatsApp closed.')
+                    return True
+            except Exception:
+                pass
+
+        # Fallback: try common process names
+        killed_any = False
+        for proc_name in ("WhatsApp.exe", "WhatsAppDesktop.exe", "WhatsApp.exe"):
+            try:
+                rc = os.system(f'taskkill /IM "{proc_name}" /F >nul 2>&1')
+                if rc == 0:
+                    killed_any = True
+            except Exception:
+                pass
+
+        if killed_any:
+            speak('WhatsApp closed.')
+            return True
+        else:
+            speak('Could not close WhatsApp programmatically. Please close it manually.')
+            return False
+    except Exception as e:
+        speak(f'Error closing WhatsApp: {e}')
+        return False
+
+def _get_whatsapp_suggestions_via_ocr(max_suggestions=5):
+    """Take a screenshot of the left pane of the WhatsApp window and OCR contact names.
+    Returns a list of suggestion strings (may be empty). Requires pytesseract.
+    """
+    if not HAS_PYTESSERACT:
+        return []
+    wins = [w for w in gw.getWindowsWithTitle('WhatsApp') if w.visible]
+    if not wins:
+        return []
+    win = wins[0]
+    try:
+        # Crop a reasonable left pane where contacts appear
+        left = win.left + 10
+        top = win.top + 80
+        right = win.left + int(min(420, win.width * 0.5))
+        bottom = win.top + int(min(win.height - 60, 600))
+        img = ImageGrab.grab(bbox=(left, top, right, bottom))
+        gray = img.convert('L')
+        text = pytesseract.image_to_string(gray)
+        # Split lines and clean
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        # Heuristic: return up to max_suggestions unique lines
+        seen = []
+        for l in lines:
+            if l not in seen:
+                seen.append(l)
+            if len(seen) >= max_suggestions:
+                break
+        return seen
+    except Exception:
+        return []
+
+
+def _click_contact_by_name_or_index(name=None, index=1):
+    """Use OCR to find a contact line by name (or phone digits) and click it.
+    If OCR is not available or fails, fall back to approximate coordinate click.
+    """
+    # If pytesseract is not available, fallback to coordinate click
+    if not HAS_PYTESSERACT:
+        try:
+            # reuse the coordinate click logic from fallback
+            wins = [w for w in gw.getWindowsWithTitle('WhatsApp') if w.visible]
+            if not wins:
+                return False
+            win = wins[0]
+            left = win.left + 10
+            top = win.top + 80
+            x = left + 60
+            y = top + 60 + (index-1) * 80
+            pyautogui.moveTo(x, y, duration=0.12)
+            pyautogui.click()
+            time.sleep(0.6)
+            return True
+        except Exception:
+            return False
+
+    wins = [w for w in gw.getWindowsWithTitle('WhatsApp') if w.visible]
+    if not wins:
+        return False
+    win = wins[0]
+    try:
+        left = win.left + 10
+        top = win.top + 80
+        right = win.left + int(min(420, win.width * 0.5))
+        bottom = win.top + int(min(win.height - 60, 600))
+        img = ImageGrab.grab(bbox=(left, top, right, bottom))
+        gray = img.convert('L')
+        # Use detailed OCR output to get bounding boxes
+        data = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT)
+        n_boxes = len(data['level'])
+        # Reconstruct lines by line_num
+        lines = {}
+        for i in range(n_boxes):
+            text = (data['text'][i] or '').strip()
+            if not text:
+                continue
+            ln = data['line_num'][i]
+            x = int(data['left'][i])
+            y = int(data['top'][i])
+            w = int(data['width'][i])
+            h = int(data['height'][i])
+            if ln not in lines:
+                lines[ln] = {'text': text, 'left': x, 'top': y, 'right': x + w, 'bottom': y + h}
+            else:
+                # append text and expand bbox
+                lines[ln]['text'] += ' ' + text
+                lines[ln]['left'] = min(lines[ln]['left'], x)
+                lines[ln]['top'] = min(lines[ln]['top'], y)
+                lines[ln]['right'] = max(lines[ln]['right'], x + w)
+                lines[ln]['bottom'] = max(lines[ln]['bottom'], y + h)
+
+        # Normalize search target
+        target = name.lower().strip() if name else None
+        target_digits = ''.join([c for c in target if c.isdigit()]) if target else None
+
+        # Try to find a matching line by substring match
+        for ln, info in lines.items():
+            txt = info['text'].lower()
+            if target and target in txt:
+                # click center
+                cx = left + info['left'] + (info['right'] - info['left']) // 2
+                cy = top + info['top'] + (info['bottom'] - info['top']) // 2
+                pyautogui.moveTo(cx, cy, duration=0.12)
+                pyautogui.click()
+                time.sleep(0.6)
+                return True
+            if target_digits and target_digits in ''.join([c for c in txt if c.isdigit()]):
+                cx = left + info['left'] + (info['right'] - info['left']) // 2
+                cy = top + info['top'] + (info['bottom'] - info['top']) // 2
+                pyautogui.moveTo(cx, cy, duration=0.12)
+                pyautogui.click()
+                time.sleep(0.6)
+                return True
+
+        # If no name match, click by visual index (first visible line is index=1)
+        sorted_lines = sorted(lines.items(), key=lambda x: x[0])
+        if 1 <= index <= len(sorted_lines):
+            info = sorted_lines[index-1][1]
+            cx = left + info['left'] + (info['right'] - info['left']) // 2
+            cy = top + info['top'] + (info['bottom'] - info['top']) // 2
+            pyautogui.moveTo(cx, cy, duration=0.12)
+            pyautogui.click()
+            time.sleep(0.6)
+            return True
+
+        # fallback coordinate click if no lines found
+        x = left + 60
+        y = top + 60 + (index-1) * 80
+        pyautogui.moveTo(x, y, duration=0.12)
+        pyautogui.click()
+        time.sleep(0.6)
+        return True
+    except Exception:
+        return False
+
+_number_words = {
+    'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+    '1': 1, '2': 2, '3': 3, '4': 4, '5': 5
+}
+
+# include common ordinal and word variants so users can say "first", "second", "1st", etc.
+_number_words.update({
+    'first': 1, 'second': 2, 'third': 3, 'fourth': 4, 'fifth': 5,
+    '1st': 1, '2nd': 2, '3rd': 3, '4th': 4, '5th': 5
+})
+
+
 
 
 
@@ -34,12 +388,63 @@ from comtypes import CLSCTX_ALL
 API_KEY = "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"
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-engine = pyttsx3.init()
+# TTS queue and worker to serialize pyttsx3 calls and avoid concurrent run loop errors
+_tts_queue = queue.Queue()
 
-def speak(text):
-    print(f"Assistant: {text}")
-    engine.say(text)
-    engine.runAndWait()
+
+def _tts_worker():
+    try:
+        t_engine = pyttsx3.init()
+    except Exception:
+        t_engine = None
+    while True:
+        text, evt = _tts_queue.get()
+        try:
+            if t_engine is None:
+                try:
+                    t_engine = pyttsx3.init()
+                except Exception:
+                    t_engine = None
+            if t_engine:
+                t_engine.say(text)
+                t_engine.runAndWait()
+        except Exception:
+            # If TTS fails, ignore and continue
+            pass
+        finally:
+            if evt:
+                try:
+                    evt.set()
+                except Exception:
+                    pass
+            _tts_queue.task_done()
+
+
+# start the TTS worker thread
+_tts_thread = threading.Thread(target=_tts_worker, daemon=True)
+_tts_thread.start()
+
+
+def speak(text, wait=True):
+    """Speak text using a background TTS worker.
+    If wait=True the call blocks until the utterance is finished.
+    """
+    try:
+        print(f"Assistant: {text}")
+        # Prevent deadlock: if speak is called from the TTS thread itself, do not wait
+        current = threading.current_thread()
+        if wait and '_tts_thread' in globals() and current is _tts_thread:
+            wait = False
+        evt = threading.Event() if wait else None
+        _tts_queue.put((text, evt))
+        if wait and evt:
+            evt.wait()
+    except Exception:
+        # best-effort: fallback to printing only
+        try:
+            print(f"Assistant(FAIL): {text}")
+        except Exception:
+            pass
 
 def normalize_command(text):
     if not text:
@@ -449,6 +854,117 @@ def take_screenshot():
 def handle_command(command):
     command = normalize_command(command)
     global search_mode_enabled
+    global awaiting_contact_search, awaiting_contact_selection, _whatsapp_search_query, whatsapp_current_chat, messaging_mode, messaging_thread
+    # Immediate overrides: if user asks to close WhatsApp at any point, do it first
+    if any(x in command for x in [
+        "close whatsapp", "close the whatsapp", "exit whatsapp", "quit whatsapp", "close the app",
+        # common speech/recognition variants
+        "close whatapp", "close what app", "close whats app", "close whatsapp", "close whatsapp app"
+    ]):
+        # clear any pending search/selection state to avoid typing into the search box
+        awaiting_contact_search = False
+        awaiting_contact_selection = False
+        _whatsapp_search_query = None
+        whatsapp_suggestions.clear() if 'whatsapp_suggestions' in globals() else None
+        close_whatsapp_app()
+        return
+    # If awaiting a contact search query (after "open whatsapp") treat the spoken command as the query
+    if awaiting_contact_search:
+        q = command.strip()
+        if q in ("cancel","exit","stop"):
+            awaiting_contact_search = False
+            speak('Cancelled contact search.')
+            return
+        ok = _search_contact_and_prepare(q)
+        if ok:
+            _whatsapp_search_query = q
+            awaiting_contact_selection = True
+            awaiting_contact_search = False
+            # Try to OCR suggestions from WhatsApp window (best-effort)
+            suggestions = _get_whatsapp_suggestions_via_ocr()
+            if suggestions:
+                # store and speak numbered list
+                whatsapp_suggestions.clear()
+                whatsapp_suggestions.extend(suggestions)
+                speak('I found the following contacts:')
+                for i, name in enumerate(whatsapp_suggestions, start=1):
+                    speak(f'{i}. {name}')
+                speak('Say the number of the contact to open it, or say the name exactly.')
+            else:
+                speak(f'I searched for {q}. I could not read suggestions automatically, please say the exact contact name to open it.')
+        return
+
+    if awaiting_contact_selection:
+        # allow numbered selection if suggestions were found
+        # Check for a spoken number word or digit
+        tokens = command.lower().split()
+        chosen_index = None
+        for t in tokens:
+            if t in _number_words:
+                chosen_index = _number_words[t]
+                break
+        if chosen_index is not None:
+            # If we have OCR-derived suggestions, prefer opening the selected suggestion
+            if whatsapp_suggestions:
+                if 1 <= chosen_index <= len(whatsapp_suggestions):
+                    chosen_name = whatsapp_suggestions[chosen_index-1]
+                    ok = _search_contact_and_prepare(chosen_name)
+                    if ok and _open_search_result_by_index(1):
+                        whatsapp_current_chat = chosen_name
+                        awaiting_contact_selection = False
+                        whatsapp_suggestions.clear() # Clear suggestions after selection
+                        speak(f'Opening chat with {chosen_name}.')
+                        return
+                    else:
+                        speak(f'Sorry, I could not open the chat for {chosen_name}.')
+                        return
+            else:
+                # No OCR suggestions available, but user said "one/first/2/second" — perform key presses
+                try:
+                    if chosen_index <= 1:
+                        # open top result
+                        if _open_top_search_result():
+                            awaiting_contact_selection = False
+                            speak('Opening the first search result.')
+                            return
+                        else:
+                            speak('Could not open the first result.')
+                            return
+                    else:
+                        # No OCR suggestions available; open by index using arrow keys
+                        try:
+                            if _open_search_result_by_index(chosen_index):
+                                awaiting_contact_selection = False
+                                speak(f'Opening result number {chosen_index}.')
+                                return
+                            else:
+                                speak('Could not open that result.')
+                                return
+                        except Exception as e:
+                            speak(f'Failed to select result: {e}')
+                            return
+                except Exception as e:
+                    speak(f'Failed to select result: {e}')
+                    return
+
+        # otherwise assume user spoke the exact contact name; type it and press Enter
+        q = command.strip()
+        if q in ("cancel","exit","stop"):
+            awaiting_contact_selection = False
+            whatsapp_suggestions.clear()
+            speak('Cancelled contact selection.')
+            return
+        ok = _search_contact_and_prepare(q)
+        if ok:
+            # try robust open by index (uses keyboard nav + OCR click fallback)
+            if _open_search_result_by_index(1):
+                whatsapp_current_chat = q
+                awaiting_contact_selection = False
+                whatsapp_suggestions.clear()
+                speak(f'Opening chat with {q}.')
+            else:
+                speak('Could not open that contact.')
+        return
     if "enable search mode" in command:
         if is_chrome_running():
             search_mode_enabled = True
@@ -474,6 +990,15 @@ def handle_command(command):
     # ...existing code... (WhatsApp feature removed)
     elif "open youtube" in command:
         open_website("youtube.com")
+    elif "open whatsapp" in command or command.strip() == "whatsapp":
+        if open_whatsapp_app():
+            # ask for contact next
+            awaiting_contact_search = True
+            speak('Who do you want to message? Say the contact name.')
+        return
+    elif "close whatsapp" in command or "exit whatsapp" in command or "quit whatsapp" in command:
+        close_whatsapp_app()
+        return
     elif "open google" in command or command == "google":
         open_website("google.com")
         google_search_mode()
@@ -494,6 +1019,55 @@ def handle_command(command):
         close_app("notepad.exe")
     elif "close chrome" in command or "close google chrome" in command:
         close_chrome()
+    if any(x in command for x in ["disable text message", "disable text", "disable text mode", "turn off text message", "stop text message"]):
+        # stop text mode if active
+        if messaging_mode == 'text':
+            messaging_mode = None
+            # give worker a moment to exit
+            if messaging_thread and messaging_thread.is_alive():
+                speak('Stopping text message mode.')
+                try:
+                    messaging_thread.join(timeout=1.0)
+                except Exception:
+                    pass
+                messaging_thread = None
+            else:
+                speak('Text message mode stopped.')
+        else:
+            speak('Text message mode is not active.')
+        return
+    if any(x in command for x in ["enable text message", "enable text", "text message"]):
+        # start text mode in a background thread
+        if not _focus_whatsapp_window():
+            speak('WhatsApp is not open. Please open it first.')
+        else:
+            # prevent multiple workers from being started
+            if messaging_mode == 'text' and messaging_thread and messaging_thread.is_alive():
+                speak('Text message mode is already active.')
+            else:
+                messaging_mode = 'text'
+                messaging_thread = threading.Thread(target=_text_message_worker, daemon=True)
+                messaging_thread.start()
+        return
+    # (voice message feature removed) - use text mode or request voice-message upload if needed
+    elif "forward message" in command:
+        # forward last assistant-sent text message to another contact
+        if not last_message_text:
+            speak('There is no message to forward.')
+            return
+        speak('Who should I forward the message to?')
+        target = get_voice_command()
+        if not target:
+            speak('No target provided.')
+            return
+        # open target chat and send last_message_text
+        if _search_contact_and_prepare(target):
+            if _open_top_search_result():
+                time.sleep(0.6)
+                _type_and_send_text_app(last_message_text)
+                speak('Message forwarded.')
+                return
+        speak('Could not forward message to the requested contact.')
     elif any(x in command for x in ["enable dark mode", "enable dark", "dark mode", "turn on dark mode", "turn on dark"]):
         if set_windows_theme(dark=True):
             speak("Dark mode enabled.")
