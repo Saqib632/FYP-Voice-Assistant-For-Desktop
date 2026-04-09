@@ -1,17 +1,7 @@
-import pygetwindow as gw
-search_mode_enabled = False
-recording_thread = None
-
-def is_chrome_running():
-    # Checks if Chrome is running
-    for proc in os.popen('tasklist').readlines():
-        if 'chrome.exe' in proc:
-            return True
-    return False
-
 import os
+import difflib
 import time
-import wmi
+import socket
 import cv2
 import numpy as np
 import requests
@@ -22,15 +12,257 @@ import subprocess
 import webbrowser
 import speech_recognition as sr
 import threading
+import json
 from datetime import datetime
 import winreg
 import ctypes
 from PIL import ImageGrab
+import pygetwindow as gw
+
+try:
+    import wmi
+    HAS_WMI = True
+except Exception:
+    wmi = None
+    HAS_WMI = False
+
 try:
     import pytesseract
     HAS_PYTESSERACT = True
 except Exception:
     HAS_PYTESSERACT = False
+
+# ========== GLOBAL VARIABLES FOR OFFLINE-FIRST MODE ==========
+OFFLINE_MODE = False  # Will be auto-set at startup
+search_mode_enabled = False
+recording_thread = None
+
+# ========== INTERNET CONNECTIVITY CHECKER ==========
+
+def check_internet_connection():
+    """
+    Check if internet is available by attempting to ping Google DNS (8.8.8.8).
+    Returns True if internet is available, False otherwise.
+    """
+    try:
+        # Try to resolve a DNS name and connect to port 53 (DNS) or port 80 (HTTP)
+        socket.create_connection(("8.8.8.8", 53), timeout=2)
+        return True
+    except (socket.timeout, socket.error, OSError):
+        pass
+    
+    try:
+        # Fallback: try to connect to Google DNS on HTTP port
+        socket.create_connection(("8.8.8.8", 80), timeout=2)
+        return True
+    except (socket.timeout, socket.error, OSError):
+        pass
+    
+    return False
+
+# ========== VOSK OFFLINE SPEECH RECOGNITION SETUP ==========
+
+_vosk_model = None
+_VOSK_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vosk-model-small-en-us-0.15")
+
+# ========== VOSK GRAMMAR (constrains recognition to known commands) ==========
+# This is the BIGGEST accuracy improvement: instead of matching against the
+# entire English language, Vosk only considers these phrases.
+_VOSK_GRAMMAR = json.dumps([
+    # Wake word
+    "nova", "hey nova",
+    # Browser & Web (split brand names into words the model knows)
+    "open you tube", "open google", "open face book", "open get hub",
+    "open chrome", "close chrome", "close google chrome", "close browser",
+    "close the chrome", "close the browser", "exit chrome", "quit chrome",
+    # Tabs
+    "new tab", "open new tab", "open a new tab", "open tab", "create tab",
+    "next tab", "switch tab", "go to next tab",
+    "previous tab", "go to previous tab", "back tab", "last tab",
+    "close tab", "exit tab",
+    # WhatsApp (split into words the model knows)
+    "open whats app", "whats app", "close whats app", "exit whats app",
+    "enable text message", "enable text", "text message",
+    "disable text message", "disable text", "disable text mode",
+    "stop text mode", "exit text mode", "stop text message",
+    "forward message",
+    # Volume
+    "increase volume", "decrease volume", "volume up", "volume down",
+    "mute", "un mute", "mute volume",
+    # Brightness
+    "increase brightness", "decrease brightness",
+    "brightness up", "brightness down",
+    # Theme
+    "enable dark mode", "enable light mode", "dark mode", "light mode",
+    "turn on dark mode", "turn on light mode",
+    "disable dark mode", "disable light mode",
+    "turn off dark mode", "turn off light mode",
+    "enable dark", "enable light", "disable dark", "disable light",
+    # WiFi (split into words the model knows)
+    "turn on wi fi", "turn off wi fi", "enable wi fi", "disable wi fi",
+    "wi fi on", "wi fi off",
+    # Search
+    "search", "search for", "enable search mode", "disable search mode",
+    "google search",
+    # Apps (split compound words)
+    "open calculator", "close calculator",
+    "open note pad", "close note pad",
+    # Folders
+    "open downloads", "open music", "open videos", "open desktop", "open documents",
+    "close downloads", "close music", "close videos", "close desktop", "close documents",
+    # Screen (split compound words)
+    "start screen recording", "stop screen recording",
+    "take a screen shot", "take screen shot", "capture screen",
+    # System
+    "exit", "stop", "cancel", "quit",
+    # Weather & AI queries
+    "what is", "who is", "weather", "weather today",
+    # Catch-all for unrecognized words
+    "[unk]"
+])
+
+# ========== KNOWN COMMANDS LIST (for fuzzy matching) ==========
+_KNOWN_COMMANDS = [
+    "nova",
+    "open youtube", "open google", "open facebook", "open github",
+    "open chrome", "close chrome", "close google chrome", "close browser",
+    "new tab", "open new tab", "next tab", "previous tab", "close tab",
+    "open whatsapp", "close whatsapp",
+    "enable text message", "disable text message", "stop text mode",
+    "forward message",
+    "increase volume", "decrease volume", "mute", "unmute",
+    "increase brightness", "decrease brightness",
+    "enable dark mode", "enable light mode", "dark mode", "light mode",
+    "disable dark mode", "disable light mode",
+    "turn on wifi", "turn off wifi", "enable wifi", "disable wifi",
+    "search", "enable search mode", "disable search mode",
+    "open calculator", "close calculator",
+    "open notepad", "close notepad",
+    "open downloads", "open music", "open videos", "open desktop", "open documents",
+    "close downloads", "close music", "close videos", "close desktop", "close documents",
+    "start screen recording", "stop screen recording",
+    "take a screenshot", "capture screen",
+    "exit", "stop", "cancel",
+]
+
+def _fuzzy_match_command(text, threshold=0.55):
+    """Find the closest known command using fuzzy matching.
+    Returns the best match if similarity >= threshold, otherwise returns original text.
+    This catches near-misses like 'close crome' -> 'close chrome'.
+    """
+    if not text:
+        return text
+    # First check for exact substring matches
+    for cmd in _KNOWN_COMMANDS:
+        if cmd in text or text in cmd:
+            return text  # already a valid match, don't change
+    # Try fuzzy matching
+    matches = difflib.get_close_matches(text, _KNOWN_COMMANDS, n=1, cutoff=threshold)
+    if matches:
+        print(f"[Fuzzy] '{text}' -> '{matches[0]}'")
+        return matches[0]
+    return text
+
+def _download_vosk_model():
+    """
+    Download the Vosk small English model (~40 MB) on first run.
+    Only called when internet is available and model is missing.
+    """
+    import urllib.request
+    import zipfile
+    model_url = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
+    base_dir  = os.path.dirname(os.path.abspath(__file__))
+    zip_path  = os.path.join(base_dir, "vosk-model-small-en-us-0.15.zip")
+    try:
+        print("Downloading Vosk speech model (~40 MB) - please wait...")
+        urllib.request.urlretrieve(model_url, zip_path)
+        print("Extracting model...")
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            zf.extractall(base_dir)
+        os.remove(zip_path)
+        print("[OK] Vosk model downloaded and ready.")
+        return True
+    except Exception as e:
+        print(f"[!] Vosk model download failed: {e}")
+        if os.path.exists(zip_path):
+            try:
+                os.remove(zip_path)
+            except Exception:
+                pass
+        return False
+
+def _init_vosk_model():
+    """
+    Load the Vosk offline model.  Auto-download if missing and internet available.
+    Returns True if the model is ready, False otherwise.
+    """
+    global _vosk_model
+    if _vosk_model is not None:
+        return True
+    try:
+        import vosk
+        vosk.SetLogLevel(-1)  # suppress noisy C++ logs
+        if not os.path.exists(_VOSK_MODEL_PATH):
+            if check_internet_connection():
+                print("[!] Vosk model not found. Downloading automatically...")
+                if not _download_vosk_model():
+                    print("[!] Could not download Vosk model.")
+                    return False
+            else:
+                print("[!] Vosk model not found and no internet available.")
+                print("    To enable voice commands: connect to internet once to auto-download the model (40 MB).")
+                print("    Until then, all commands can be typed at the prompt.")
+                return False
+        _vosk_model = vosk.Model(_VOSK_MODEL_PATH)
+        print("[OK] Vosk offline speech model loaded.")
+        return True
+    except ImportError:
+        print("[!] vosk package not installed. Run: pip install vosk")
+        return False
+    except Exception as e:
+        print(f"[!] Vosk model init failed: {e}")
+        return False
+
+def _recognize_with_vosk(audio, use_grammar=True):
+    """
+    Transcribe an sr.AudioData object using the loaded Vosk model.
+    Uses grammar-constrained recognition by default for command accuracy.
+    Falls back to unconstrained recognition when use_grammar=False
+    (for free-form input like contact names or search queries).
+    Raises sr.UnknownValueError when nothing was understood.
+    """
+    import vosk
+    # Convert to 16-kHz 16-bit PCM that Vosk expects
+    wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
+
+    # Create recognizer: grammar-constrained or free-form
+    if use_grammar:
+        rec = vosk.KaldiRecognizer(_vosk_model, 16000, _VOSK_GRAMMAR)
+    else:
+        rec = vosk.KaldiRecognizer(_vosk_model, 16000)
+
+    # Stream audio in chunks for better accuracy
+    # (Vosk's internal language model tracks context better with streaming)
+    chunk_size = 4000
+    for i in range(0, len(wav_bytes), chunk_size):
+        rec.AcceptWaveform(wav_bytes[i:i + chunk_size])
+
+    result = json.loads(rec.FinalResult())
+    text = result.get("text", "").strip()
+
+    # Filter out Vosk's [unk] placeholder
+    text = text.replace("[unk]", "").strip()
+
+    if not text:
+        raise sr.UnknownValueError()
+    return text
+
+def is_chrome_running():
+    """Checks if Chrome is running"""
+    for proc in os.popen('tasklist').readlines():
+        if 'chrome.exe' in proc:
+            return True
+    return False
 
 # WhatsApp Desktop integration (keyboard automation)
 whatsapp_current_chat = None
@@ -160,7 +392,7 @@ def _text_message_worker():
     try:
         while messaging_mode == 'text':
             try:
-                cmd = get_voice_command()
+                cmd = get_voice_command(free_form=True)
             except Exception as e:
                 # Catch any exceptions from the recognizer and switch to text input
                 speak(f'Voice input error: {e}. Switching to text input for this message.', wait=False)
@@ -450,75 +682,225 @@ def normalize_command(text):
     if not text:
         return ""
     normalized = text.lower().strip()
+
+    # ---- Rejoin split words from Vosk grammar ----
+    # The Vosk small model doesn't know compound/brand words, so the grammar
+    # uses split forms. We rejoin them here to match the command handler.
+    normalized = normalized.replace("you tube", "youtube")
+    normalized = normalized.replace("face book", "facebook")
+    normalized = normalized.replace("get hub", "github")
+    normalized = normalized.replace("whats app", "whatsapp")
+    normalized = normalized.replace("note pad", "notepad")
+    normalized = normalized.replace("screen shot", "screenshot")
+    normalized = normalized.replace("un mute", "unmute")
     normalized = normalized.replace("wi-fi", "wifi")
     normalized = normalized.replace("wi fi", "wifi")
+
+    # ---- Phonetic corrections for "nova" wake-word mishearings ----
+    _nova_phonetics = [
+        "no one", "no wan", "no won", "no want", "know one",
+        "wrong", "ron", "rong", "grown",
+        "no", "know", "known", "now",
+        "noba", "novia", "nava", "novah", "no va", "nova",
+        "mova", "moved", "move", "lover", "over",
+        "noaa", "nope", "nota", "norma", "noah"
+    ]
+    if normalized in _nova_phonetics:
+        normalized = "nova"
+
+    # ---- Phonetic corrections for "open" mishearings ----
+    _open_phonetics = [
+        "upon", "often", "hoping", "oven", "oh pen",
+        "oh been", "oben", "opan", "opin"
+    ]
+    _open_targets = [
+        "youtube", "google", "facebook", "github", "chrome",
+        "whatsapp", "calculator", "notepad",
+        "downloads", "music", "videos", "desktop", "documents"
+    ]
+    for misspell in _open_phonetics:
+        for target in _open_targets:
+            normalized = normalized.replace(misspell + " " + target, "open " + target)
+
+    # ---- Phonetic corrections for "close" mishearings ----
+    _close_phonetics = [
+        "laws", "clause", "claws", "clothes", "clues", "glows", "flows",
+        "clos", "cloz", "clothe", "cloe", "lows", "lose", "closs", "cloes",
+        "clouse", "kloz", "klose", "klos", "cloth", "glows", "blows",
+        "plus", "class", "glass", "gross"
+    ]
+    _close_targets = [
+        "chrome", "google chrome", "notepad", "whatsapp", "tab",
+        "the app", "window", "app", "browser", "calculator"
+    ]
+    for misspell in _close_phonetics:
+        for target in _close_targets:
+            normalized = normalized.replace(misspell + " " + target, "close " + target)
+
+    # ---- Phonetic corrections for "tab" mishearings ----
+    _tab_phonetics = [
+        "bab", "bad", "dab", "dad", "nab", "jab", "lab", "cab",
+        "tap", "tag", "tat", "bat", "mat", "nat", "pat", "rat",
+        "sad", "lad", "had", "tab"
+    ]
+    _tab_prefixes = ["new ", "next ", "previous ", "close ", "open new "]
+    for prefix in _tab_prefixes:
+        for misspell in _tab_phonetics:
+            normalized = normalized.replace(prefix + misspell, prefix + "tab")
+    _tab_open_variants = ["open a new " + m for m in _tab_phonetics] + \
+                         ["open new " + m for m in _tab_phonetics]
+    for variant in _tab_open_variants:
+        normalized = normalized.replace(variant, "new tab")
+
+    # ---- Phonetic corrections for "volume" mishearings ----
+    _volume_phonetics = ["follow me", "fallen", "volume", "vellum", "villain", "volley"]
+    for misspell in _volume_phonetics:
+        if misspell == "volume":
+            continue
+        normalized = normalized.replace("increase " + misspell, "increase volume")
+        normalized = normalized.replace("decrease " + misspell, "decrease volume")
+
+    # ---- Phonetic corrections for "brightness" mishearings ----
+    _brightness_phonetics = ["rightness", "bright mess", "bright ness", "brightest", "writeness"]
+    for misspell in _brightness_phonetics:
+        normalized = normalized.replace("increase " + misspell, "increase brightness")
+        normalized = normalized.replace("decrease " + misspell, "decrease brightness")
+
+    # ---- Phonetic corrections for "screenshot" mishearings ----
+    _screenshot_phonetics = [
+        "screen shot", "screens hot", "screen shut",
+        "screen shirt", "green shot", "screen chart"
+    ]
+    for misspell in _screenshot_phonetics:
+        normalized = normalized.replace("take a " + misspell, "take a screenshot")
+        normalized = normalized.replace(misspell, "screenshot")
+
+    # ---- Phonetic corrections for "recording" mishearings ----
+    _recording_phonetics = ["record in", "report in", "recording", "regarding"]
+    for misspell in _recording_phonetics:
+        if misspell == "recording":
+            continue
+        normalized = normalized.replace("start screen " + misspell, "start screen recording")
+        normalized = normalized.replace("stop screen " + misspell, "stop screen recording")
+
+    # ---- Phonetic corrections for "mute/unmute" mishearings ----
+    _mute_phonetics = ["meet", "mood", "moot", "moot", "muted"]
+    if normalized in _mute_phonetics:
+        normalized = "mute"
+    _unmute_phonetics = ["on mute", "on meet", "unmuted", "and mute", "un mute"]
+    if normalized in _unmute_phonetics:
+        normalized = "unmute"
+
+    # ---- Final: apply fuzzy matching to catch remaining near-misses ----
+    normalized = _fuzzy_match_command(normalized)
+
     return normalized
 
-def get_voice_command(prompt=None):
+def get_voice_command(prompt=None, free_form=False):
+    """
+    Offline-first speech recognition pipeline:
+      Tier 1  - Vosk          (offline, grammar-constrained for commands)
+      Tier 2  - PocketSphinx  (offline fallback when Vosk model not yet downloaded)
+      Tier 3  - Google SR     (online fallback, only when internet available)
+
+    When free_form=True, skips grammar constraints (for contact names,
+    search queries, etc.)
+
+    Recognition failures (could not understand) -> return None -> main loop retries.
+    Text input is ONLY used when the microphone itself is unavailable.
+    """
+    global OFFLINE_MODE
+
     recognizer = sr.Recognizer()
-    
-    recognizer.energy_threshold = 300
+    # Optimized audio capture settings for better command recognition
+    recognizer.energy_threshold         = 1500   # lower = picks up quieter speech
     recognizer.dynamic_energy_threshold = True
-    recognizer.pause_threshold = 0.8
-    recognizer.phrase_threshold = 0.3
-    recognizer.non_speaking_duration = 0.8
-    
+    recognizer.pause_threshold          = 0.7    # faster response for short commands
+    recognizer.phrase_threshold         = 0.2    # catch shorter utterances
+    recognizer.non_speaking_duration    = 0.5    # faster end-of-phrase detection
+
+    # ---------- capture audio ----------
     try:
         with sr.Microphone() as source:
-            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            # Longer ambient noise calibration for a better noise floor
+            recognizer.adjust_for_ambient_noise(source, duration=1.5)
             if prompt:
                 speak(prompt)
             print("Listening...")
-            audio = recognizer.listen(source, timeout=10, phrase_time_limit=5)
-
-            # Try Google Speech Recognition first
-            try:
-                command = normalize_command(recognizer.recognize_google(audio))
-                print(f"Command: {command}")
-                return command
-
-            except sr.RequestError:
-                # No internet available → try offline recognition
-                print("No internet connection. Switching to offline recognition...")
-                speak("No internet connection. Using offline mode.")
-                try:
-                    command = normalize_command(recognizer.recognize_sphinx(audio))
-                    print(f"Command (offline): {command}")
-                    return command
-                except sr.UnknownValueError:
-                    speak("Sorry, could not understand you in offline mode. You may type manually.")
-                    return None
-                except Exception as e:
-                    speak(f"Offline recognition failed: {e}. Switching to text input.")
-                    return get_text_input()
-
-            except sr.UnknownValueError:
-                speak("Sorry, I did not understand. Please try again.")
-                return None
-
+            # timeout=15 waits up to 15s for speech to start
+            # phrase_time_limit=10 captures up to 10s of actual speech
+            audio = recognizer.listen(source, timeout=15, phrase_time_limit=10)
     except sr.WaitTimeoutError:
-        speak("Listening timeout. Please try again.")
-        return None
-    except OSError as e:
-        if "No default input device" in str(e):
-            speak("No microphone found. Switching to text input.")
-        else:
-            speak(f"Microphone error: {e}. Switching to text input.")
+        return None          # silence - loop back quietly
+    except OSError:
+        print("Microphone not found. Please type your command.")
         return get_text_input()
     except Exception as e:
-        speak(f"Unexpected error: {e}. Switching to text input.")
+        print(f"Audio capture error: {e}")
         return get_text_input()
 
+    print("Processing your command...")
+
+    # ---------- TIER 1: Vosk (offline, grammar-constrained) ----------
+    if _vosk_model is not None:
+        try:
+            # First pass: grammar-constrained (unless free_form requested)
+            text = _recognize_with_vosk(audio, use_grammar=not free_form)
+            command = normalize_command(text)
+            if command:
+                print(f"Command: {command}")
+                return command
+        except sr.UnknownValueError:
+            # Grammar-constrained pass failed; try unconstrained as fallback
+            if not free_form:
+                try:
+                    text = _recognize_with_vosk(audio, use_grammar=False)
+                    command = normalize_command(text)
+                    if command:
+                        print(f"Command (fallback): {command}")
+                        return command
+                except sr.UnknownValueError:
+                    pass  # truly could not understand
+                except Exception as e:
+                    print(f"[Vosk fallback] Error: {e}")
+        except Exception as e:
+            print(f"[Vosk] Error: {e}")
+
+    # ---------- TIER 2: PocketSphinx (offline fallback) ----------
+    elif OFFLINE_MODE:
+        try:
+            text = recognizer.recognize_sphinx(audio)
+            command = normalize_command(text)
+            if command:
+                print(f"Command: {command}")
+                return command
+        except sr.UnknownValueError:
+            pass   # could not understand - loop back
+        except Exception as e:
+            print(f"[Offline] Recognition error: {e}")
+
+    # ---------- TIER 3: Google SR (online only) ----------
+    if not OFFLINE_MODE:
+        try:
+            text = recognizer.recognize_google(audio)
+            command = normalize_command(text)
+            if command:
+                print(f"Command: {command}")
+                return command
+        except sr.RequestError:
+            print("[Google SR] Unavailable - switching to offline mode.")
+            OFFLINE_MODE = True
+            speak("Internet lost. Switching to offline mode.")
+        except sr.UnknownValueError:
+            pass   # could not understand - loop back
+
+    # Could not understand in any engine - return None so main loop retries
+    return None
+
 def get_text_input():
-    """Fallback text input when speech recognition fails"""
+    """Text input fallback when speech recognition is unavailable or fails"""
     try:
-        print("\n" + "="*50)
-        print("SPEECH RECOGNITION UNAVAILABLE")
-        print("Switching to text input mode...")
-        print("Type your commands or 'exit' to quit")
-        print("="*50)
-        
-        command = input("\nEnter command: ").strip()
+        command = input("Type command: ").strip()
         if command:
             return normalize_command(command)
         return None
@@ -528,6 +910,18 @@ def get_text_input():
         return "exit"
 
 def ask_openrouter(question):
+    """
+    Query OpenRouter API for LLM-based responses.
+    Only works when internet is available.
+    Returns a response string or offline message.
+    """
+    global OFFLINE_MODE
+    
+    if OFFLINE_MODE:
+        offline_msg = "This feature requires internet connection. Please enable internet to use this feature."
+        speak(offline_msg)
+        return offline_msg
+    
     headers = {
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json"
@@ -537,9 +931,16 @@ def ask_openrouter(question):
         "messages": [{"role": "user", "content": question}]
     }
     try:
-        response = requests.post(API_URL, headers=headers, json=data)
+        response = requests.post(API_URL, headers=headers, json=data, timeout=10)
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
+    except requests.exceptions.RequestException as e:
+        print(f"API request failed: {e}")
+        # Mark offline mode if internet failed
+        OFFLINE_MODE = True
+        offline_msg = "Internet connection lost. This feature is unavailable in offline mode."
+        speak(offline_msg)
+        return offline_msg
     except Exception as e:
         return f"Failed to get a response: {e}"
 
@@ -551,10 +952,26 @@ def open_item(path):
         speak(f"Unable to open: {e}")
 
 def open_website(url):
-    chrome_path = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-    webbrowser.register('chrome', None, webbrowser.BackgroundBrowser(chrome_path))
-    webbrowser.get('chrome').open(f"https://{url}")
-    speak(f"Opening {url.replace('.com','')}")
+    """
+    Open a website in Chrome.
+    Only works when internet is available.
+    """
+    global OFFLINE_MODE
+    
+    if OFFLINE_MODE:
+        offline_msg = f"Internet not available. Cannot open {url.replace('.com', '')}."
+        speak(offline_msg)
+        return False
+    
+    try:
+        chrome_path = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+        webbrowser.register('chrome', None, webbrowser.BackgroundBrowser(chrome_path))
+        webbrowser.get('chrome').open(f"https://{url}")
+        speak(f"Opening {url.replace('.com','')}")
+        return True
+    except Exception as e:
+        speak(f"Failed to open {url}: {e}")
+        return False
 
 def close_app(app_name):
     try:
@@ -609,32 +1026,60 @@ def close_chrome():
 
 def change_volume(action):
     try:
+        from comtypes import CLSCTX_ALL
+        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+        from ctypes import cast, POINTER
+        
         devices = AudioUtilities.GetSpeakers()
-        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        interface = devices.Activate(
+            IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
         volume = cast(interface, POINTER(IAudioEndpointVolume))
-        current = volume.GetMasterVolumeLevelScalar()
-        is_muted = volume.GetMute()
-
+        
         if action == "increase":
+            current = volume.GetMasterVolumeLevelScalar()
             volume.SetMasterVolumeLevelScalar(min(current + 0.1, 1.0), None)
             speak("Volume increased.")
         elif action == "decrease":
+            current = volume.GetMasterVolumeLevelScalar()
             volume.SetMasterVolumeLevelScalar(max(current - 0.1, 0.0), None)
             speak("Volume decreased.")
         elif action == "mute":
             volume.SetMute(1, None)
             speak("Volume muted.")
         elif action == "unmute":
+            is_muted = volume.GetMute()
             if is_muted:
                 volume.SetMute(0, None)
                 speak("Volume unmuted.")
             else:
                 speak("Already unmuted.")
+    except AttributeError as e:
+        # Fallback to keyboard shortcuts using pyautogui
+        try:
+            if action == "mute":
+                pyautogui.press("volumemute")
+                speak("Volume muted.")
+            elif action == "unmute":
+                pyautogui.press("volumemute")
+                speak("Volume unmuted.")
+            elif action == "increase":
+                for _ in range(2):
+                    pyautogui.press("volumeup")
+                speak("Volume increased.")
+            elif action == "decrease":
+                for _ in range(2):
+                    pyautogui.press("volumedown")
+                speak("Volume decreased.")
+        except Exception as fallback_error:
+            speak("Volume control not available.")
     except Exception as e:
         speak(f"Volume error: {e}")
 
 def change_brightness(action):
     try:
+        if not HAS_WMI:
+            speak("Brightness control requires the optional 'wmi' package.")
+            return
         wmi_obj = wmi.WMI(namespace='wmi')
         monitors = wmi_obj.WmiMonitorBrightnessMethods()
         current = wmi_obj.WmiMonitorBrightness()[0].CurrentBrightness
@@ -676,6 +1121,7 @@ def set_windows_theme(dark=True):
         return False
 
 
+
 # ========== WIFI CONTROL ==========
 
 def get_wifi_interface_name():
@@ -700,30 +1146,66 @@ def set_wifi_enabled(enabled):
     try:
         interface_name = get_wifi_interface_name()
         state = "enabled" if enabled else "disabled"
-        command = f'netsh interface set interface name="{interface_name}" admin={state}'
-        result = subprocess.run(command, shell=True, capture_output=True, text=True)
+        
+        # Use PowerShell with elevated privileges to run netsh command
+        ps_command = f"Start-Process -Verb RunAs -FilePath 'netsh' -ArgumentList 'interface set interface name=\"{interface_name}\" admin={state}' -Wait -WindowStyle Hidden"
+        
+        # Try PowerShell approach first (requires elevation at Electron level)
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_command],
+            capture_output=True,
+            text=True,
+            shell=True
+        )
 
         if result.returncode == 0:
-            speak(f"Wi-Fi {'turned on' if enabled else 'turned off'}.")
+            status = 'turned on' if enabled else 'turned off'
+            speak(f"Wi-Fi {status}.")
+            print(f"[SUCCESS] Wi-Fi {status}")
         else:
-            speak(f"Failed to {'enable' if enabled else 'disable'} Wi-Fi. Try running as administrator.")
+            # Fallback: Try direct netsh command (may work if Electron is admin)
+            command = f'netsh interface set interface name="{interface_name}" admin={state}'
+            result = subprocess.run(command, shell=True, capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                status = 'turned on' if enabled else 'turned off'
+                speak(f"Wi-Fi {status}.")
+                print(f"[SUCCESS] Wi-Fi {status}")
+            else:
+                error_msg = result.stderr if result.stderr else "Access Denied - Admin Required"
+                print(f"[ERROR] WiFi command failed: {error_msg}")
+                speak(f"Failed to {'enable' if enabled else 'disable'} Wi-Fi. The application must be running as administrator.")
     except Exception as e:
+        print(f"[ERROR] Wi-Fi control exception: {e}")
         speak(f"Wi-Fi control error: {e}")
 
 # ========== GOOGLE SEARCH MODE ==========
 
 def google_search_mode():
+    """
+    Enable Google search mode (online-only feature).
+    Returns early if internet is not available.
+    """
+    global OFFLINE_MODE
+    
+    if OFFLINE_MODE:
+        speak("Internet not available. Cannot access Google Search.")
+        return
+    
     speak("What would you like to search for?")
     while True:
-        query = get_voice_command()
-        if any(x in query for x in ["exit", "stop", "cancel"]):
+        query = get_voice_command(free_form=True)
+        if query and any(x in query for x in ["exit", "stop", "cancel"]):
             speak("Exiting search.")
             break
         elif query:
-            chrome_path = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-            webbrowser.register('chrome', None, webbrowser.BackgroundBrowser(chrome_path))
-            webbrowser.get('chrome').open(f"https://www.google.com/search?q={query}")
-            speak(f"Searching for {query}")
+            try:
+                chrome_path = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+                webbrowser.register('chrome', None, webbrowser.BackgroundBrowser(chrome_path))
+                webbrowser.get('chrome').open(f"https://www.google.com/search?q={query}")
+                speak(f"Searching for {query}")
+            except Exception as e:
+                speak(f"Search failed: {e}")
 
 # ========== CHROME TABS CONTROL ==========
 
@@ -735,8 +1217,18 @@ def manage_chrome_tabs(action):
         # Bring Chrome to the foreground
         chrome_windows = [w for w in gw.getWindowsWithTitle('Google Chrome') if w.visible]
         if chrome_windows:
-            chrome_windows[0].activate()
-            time.sleep(0.2)  # Give time for window to focus
+            chrome_win = chrome_windows[0]
+            # Try pygetwindow activate first; fall back to ctypes on Windows pipe error
+            try:
+                chrome_win.activate()
+            except Exception:
+                try:
+                    hwnd = chrome_win._hWnd
+                    ctypes.windll.user32.ShowWindow(hwnd, 9)   # SW_RESTORE = 9
+                    ctypes.windll.user32.SetForegroundWindow(hwnd)
+                except Exception:
+                    pass
+            time.sleep(0.3)  # Give time for window to focus
         else:
             speak("Could not find a visible Chrome window to focus.")
             return
@@ -853,8 +1345,26 @@ def take_screenshot():
 
 def handle_command(command):
     command = normalize_command(command)
-    global search_mode_enabled
+    global search_mode_enabled, OFFLINE_MODE
     global awaiting_contact_search, awaiting_contact_selection, _whatsapp_search_query, whatsapp_current_chat, messaging_mode, messaging_thread
+
+    # ---- Wake word: bring Nova window to foreground ----
+    # When the user says "nova" (or close variants), signal the Electron
+    # main process to restore and focus the window.
+    _aivon_variants = [
+        "nova", "no va", "nова", "nova assistant",
+        "maven", "noba", "novah", "novia", "nava",
+        # common mishearings observed in logs:
+        "no one", "no wan", "no won", "know one", "no want",
+        "wrong", "ron", "rong",
+        "no", "know", "known", "now",
+        "mova", "move", "moved"
+    ]
+    if any(command.strip() == v for v in _aivon_variants):
+        print("[FOCUS_WINDOW]", flush=True)
+        speak("Yes, I am here.")
+        return
+
     # Immediate overrides: if user asks to close WhatsApp at any point, do it first
     if any(x in command for x in [
         "close whatsapp", "close the whatsapp", "exit whatsapp", "quit whatsapp", "close the app",
@@ -868,6 +1378,7 @@ def handle_command(command):
         whatsapp_suggestions.clear() if 'whatsapp_suggestions' in globals() else None
         close_whatsapp_app()
         return
+    
     # If awaiting a contact search query (after "open whatsapp") treat the spoken command as the query
     if awaiting_contact_search:
         q = command.strip()
@@ -965,7 +1476,11 @@ def handle_command(command):
             else:
                 speak('Could not open that contact.')
         return
+    
     if "enable search mode" in command:
+        if OFFLINE_MODE:
+            speak("Internet not available. Search mode requires internet connection.")
+            return
         if is_chrome_running():
             search_mode_enabled = True
             speak("Search mode enabled. Say your search queries.")
@@ -982,12 +1497,14 @@ def handle_command(command):
         if any(x in command for x in ["exit", "stop", "cancel"]):
             search_mode_enabled = False
             speak("Exiting search mode.")
-        elif command:
-            chrome_path = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-            webbrowser.register('chrome', None, webbrowser.BackgroundBrowser(chrome_path))
-            webbrowser.get('chrome').open(f"https://www.google.com/search?q={command}")
-            speak(f"Searching for {command}")
-    # ...existing code... (WhatsApp feature removed)
+        elif command and not OFFLINE_MODE:
+            try:
+                chrome_path = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+                webbrowser.register('chrome', None, webbrowser.BackgroundBrowser(chrome_path))
+                webbrowser.get('chrome').open(f"https://www.google.com/search?q={command}")
+                speak(f"Searching for {command}")
+            except Exception as e:
+                speak(f"Search failed: {e}")
     elif "open youtube" in command:
         open_website("youtube.com")
     elif "open whatsapp" in command or command.strip() == "whatsapp":
@@ -1017,7 +1534,12 @@ def handle_command(command):
         subprocess.Popen(["notepad.exe"])
     elif "close notepad" in command:
         close_app("notepad.exe")
-    elif "close chrome" in command or "close google chrome" in command:
+    elif any(x in command for x in [
+        "close chrome", "close google chrome", "close the chrome",
+        "shut chrome", "shut down chrome", "exit chrome", "quit chrome",
+        "kill chrome", "stop chrome", "close browser", "close the browser",
+        "exit browser", "quit browser"
+    ]):
         close_chrome()
     if any(x in command for x in ["disable text message", "disable text", "disable text mode", "turn off text message", "stop text message"]):
         # stop text mode if active
@@ -1056,7 +1578,7 @@ def handle_command(command):
             speak('There is no message to forward.')
             return
         speak('Who should I forward the message to?')
-        target = get_voice_command()
+        target = get_voice_command(free_form=True)
         if not target:
             speak('No target provided.')
             return
@@ -1068,6 +1590,18 @@ def handle_command(command):
                 speak('Message forwarded.')
                 return
         speak('Could not forward message to the requested contact.')
+    # Disable/Turn-off handlers for dark/light mode (more specific patterns checked before enable)
+    elif any(x in command for x in ["disable dark mode", "disable dark", "turn off dark mode", "turn off dark"]):
+        if set_windows_theme(dark=False):
+            speak("Dark mode disabled.")
+        else:
+            speak("Could not disable dark mode.")
+    elif any(x in command for x in ["disable light mode", "disable light", "turn off light mode", "turn off light"]):
+        if set_windows_theme(dark=True):
+            speak("Light mode disabled.")
+        else:
+            speak("Could not disable light mode.")
+    # Enable/Turn-on handlers for dark/light mode (checked after disable patterns)
     elif any(x in command for x in ["enable dark mode", "enable dark", "dark mode", "turn on dark mode", "turn on dark"]):
         if set_windows_theme(dark=True):
             speak("Dark mode enabled.")
@@ -1094,15 +1628,31 @@ def handle_command(command):
         set_wifi_enabled(True)
     elif any(x in command for x in ["turn off wifi", "disable wifi", "wifi off", "turn off wi-fi", "disable wi-fi", "wi-fi off", "off wifi"]):
         set_wifi_enabled(False)
-    elif "new tab" in command:
+    elif any(x in command for x in [
+        "new tab", "open new tab", "open a new tab", "a new tab",
+        "open tab", "create tab", "create new tab"
+    ]):
         manage_chrome_tabs("new")
-    elif "next tab" in command:
+    elif any(x in command for x in [
+        "next tab", "switch tab", "tab next", "go to next tab",
+        "move to next tab", "forward tab"
+    ]):
         manage_chrome_tabs("next")
-    elif "previous tab" in command:
+    elif any(x in command for x in [
+        "previous tab", "prev tab", "tab previous", "go to previous tab",
+        "move to previous tab", "back tab", "go back tab", "last tab"
+    ]):
         manage_chrome_tabs("previous")
-    elif "close tab" in command:
+    elif any(x in command for x in [
+        "close tab", "shut tab", "exit tab", "remove tab", "delete tab"
+    ]):
         manage_chrome_tabs("close")
     elif "search for" in command or "what is the weather" in command or "weather today" in command or command.strip() == "weather":
+        # Weather and search are online-only features
+        if OFFLINE_MODE:
+            speak("Internet not available. Cannot search or get weather information.")
+            return
+        
         if "search for" in command:
             query = command.replace("search for", "").strip()
             if not query:
@@ -1115,11 +1665,19 @@ def handle_command(command):
             query = "weather"
         else:
             query = command
-        speak(f"Searching for {query}")
-        chrome_path = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-        webbrowser.register('chrome', None, webbrowser.BackgroundBrowser(chrome_path))
-        webbrowser.get('chrome').open(f"https://www.google.com/search?q={query}")
+        
+        try:
+            speak(f"Searching for {query}")
+            chrome_path = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+            webbrowser.register('chrome', None, webbrowser.BackgroundBrowser(chrome_path))
+            webbrowser.get('chrome').open(f"https://www.google.com/search?q={query}")
+        except Exception as e:
+            speak(f"Search failed: {e}")
     elif "what is" in command or "who is" in command or "define" in command:
+        # LLM queries are online-only
+        if OFFLINE_MODE:
+            speak("Internet not available. This feature requires internet connection.")
+            return
         response = ask_openrouter(command)
         speak(response)
     elif command.startswith("open"):
@@ -1145,31 +1703,51 @@ def handle_command(command):
         speak("Sorry, I don't understand that command.")
 
 def main():
-    speak("Voice assistant is now active.")
-    print("Voice assistant is now active.")
-    print("Note: Turning off WiFi will switch to offline mode or text input.")
-    print("Press Ctrl+C to exit.\n")
-    
-    consecutive_failures = 0
+    global OFFLINE_MODE
+
+    print("="*60)
+    print("       VOICE ASSISTANT  -  OFFLINE-FIRST")
+    print("="*60)
+
+    # 1. Internet check
+    print("[1/2] Checking internet connectivity...")
+    OFFLINE_MODE = not check_internet_connection()
+
+    # 2. Vosk model init  (auto-download if internet available)
+    print("[2/2] Loading offline speech model...")
+    vosk_ready = _init_vosk_model()
+
+    # ---- status report ----
+    print("="*60)
+    if OFFLINE_MODE:
+        print("  MODE : OFFLINE")
+        print("  VOICE: " + ("Vosk (offline)" if vosk_ready else "Text input only"))
+        print("  APPS : volume / brightness / wifi / theme / apps / tabs")
+        print("  OFF  : web search / weather / LLM (need internet)")
+        speak("Offline mode active. System commands are ready.")
+    else:
+        print("  MODE : ONLINE")
+        print("  VOICE: " + ("Vosk (offline) + Google fallback" if vosk_ready else "Google Speech Recognition"))
+        print("  ALL  : system automation + search + weather + LLM")
+        speak("Online mode. All features are available.")
+    print("="*60)
+    print("Speak a command clearly, or type it when prompted.")
+    print("Press Ctrl+C to exit.")
+    print()
+
     while True:
         try:
             command = get_voice_command()
-            if command is None:
-                print("Speech recognition failed. Please try again.")
-                time.sleep(1)
-                continue
-            elif command:
+            if command:
                 handle_command(command)
-            else:
-                continue
+            # None = silence/timeout -> loop back silently
         except KeyboardInterrupt:
-            print("\nExiting voice assistant...")
+            print("\nExiting...")
             speak("Goodbye!")
             break
         except Exception as e:
-            print(f"Unexpected error: {e}")
-            speak("An error occurred. Please try again.")
-            time.sleep(1)
+            print(f"Error: {e}")
+            time.sleep(0.5)
 
 if __name__ == "__main__":
     main()
